@@ -38,7 +38,7 @@ class Config:
     
     # Trading logic
     PREDICTION_THRESHOLD = 0.65  # Minimum confidence for signal
-    SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD']
+    SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'XAUUSD']
     TIMEFRAME = 'H1'
     
    # Feature engineering - REDUCED untuk data yang masih sedikit
