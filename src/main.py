@@ -148,7 +148,7 @@ class FeatureEngineer:
         df['trend_strength'] = abs(df['macd_main'] - df['macd_signal'])
         
         # Volume ratio
-        df['volume_ratio'] = df['volume'] / df['volume'].rolling(20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume'].rolling(10).mean()
         
         # Time-based features
         df['hour_of_day'] = df['timestamp'].dt.hour
