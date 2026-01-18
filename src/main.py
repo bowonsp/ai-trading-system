@@ -166,10 +166,19 @@ class FeatureEngineer:
         df['profitable_long'] = (df['future_return_1h'] > 0.0002).astype(int)  # >2 pips
         df['profitable_short'] = (df['future_return_1h'] < -0.0002).astype(int)
         
-        # Drop rows with NaN
-        df = df.dropna()
-        
-        print(f"✅ Features created: {len(df)} complete records")
+        # Drop NaN hanya di kolom yang penting untuk training
+        important_cols = [
+        'close', 'volume', 'rsi_14', 'macd_main', 'macd_signal',
+        'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
+        'volatility_ratio', 'trend_strength', 'volume_ratio',
+        'hour_of_day', 'day_of_week', 'session_encoded',
+        'future_return_1h', 'profitable_long', 'profitable_short']
+
+        # Drop hanya baris yang ada NaN di kolom penting
+        existing_cols = [col for col in important_cols if col in df.columns]
+        df = df.dropna(subset=existing_cols)
+
+        print(f"   Debug: After dropna, rows: {len(df)}")
         return df
     
     def _get_session(self, hour: int) -> str:
