@@ -1,6 +1,7 @@
 """
 AI Trading System - Complete Python Pipeline
 Reads data from Supabase → Trains AI → Writes predictions back
+Version 1.1 - With New Data Detection (Only train when new data arrives)
 """
 
 import os
@@ -25,9 +26,6 @@ from supabase import create_client, Client
 # ================================================================
 
 class Config:
-    import os
-
-class Config:
     # Supabase credentials - baca dari environment variable
     SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://kktfrmvwzykkzosvzddn.supabase.co')
     SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
@@ -38,12 +36,13 @@ class Config:
     
     # Trading logic
     PREDICTION_THRESHOLD = 0.65  # Minimum confidence for signal
-    SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'XAUUSD']
+    SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
+               'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'XAUUSD']
     TIMEFRAME = 'H1'
     
-   # Feature engineering - REDUCED untuk data yang masih sedikit
-    MOMENTUM_PERIODS = [3, 5, 10]  # Dari [5,10,20] jadi [3,5,10]
-    VOLATILITY_WINDOW = 10  # Dari 20 jadi 10
+    # Feature engineering - REDUCED untuk data yang masih sedikit
+    MOMENTUM_PERIODS = [3, 5, 10]
+    VOLATILITY_WINDOW = 10
     
     # Training
     TEST_SIZE = 0.2
@@ -148,7 +147,7 @@ class FeatureEngineer:
         df['trend_strength'] = abs(df['macd_main'] - df['macd_signal'])
         
         # Volume ratio
-        df['volume_ratio'] = df['volume'] / df['volume'].rolling(10).mean()
+        df['volume_ratio'] = df['volume'] / df['volume'].rolling(self.config.VOLATILITY_WINDOW).mean()
         
         # Time-based features
         df['hour_of_day'] = df['timestamp'].dt.hour
@@ -168,17 +167,18 @@ class FeatureEngineer:
         
         # Drop NaN hanya di kolom yang penting untuk training
         important_cols = [
-        'close', 'volume', 'rsi_14', 'macd_main', 'macd_signal',
-        'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
-        'volatility_ratio', 'trend_strength', 'volume_ratio',
-        'hour_of_day', 'day_of_week', 'session_encoded',
-        'future_return_1h', 'profitable_long', 'profitable_short']
-
+            'close', 'volume', 'rsi_14', 'macd_main', 'macd_signal',
+            'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
+            'volatility_ratio', 'trend_strength', 'volume_ratio',
+            'hour_of_day', 'day_of_week', 'session_encoded',
+            'future_return_1h', 'profitable_long', 'profitable_short'
+        ]
+        
         # Drop hanya baris yang ada NaN di kolom penting
         existing_cols = [col for col in important_cols if col in df.columns]
         df = df.dropna(subset=existing_cols)
-
-        print(f"   Debug: After dropna, rows: {len(df)}")
+        
+        print(f"✅ Features created: {len(df)} complete records")
         return df
     
     def _get_session(self, hour: int) -> str:
@@ -229,7 +229,7 @@ class FeatureEngineer:
             
             print(f"✅ Saved {len(records)} feature records to database")
         except Exception as e:
-            print(f"❌ Error saving features: {e}")
+            print(f"⚠️ Note: {e}")
 
 # ================================================================
 # 3. AI MODEL - Train and Predict
@@ -251,7 +251,7 @@ class AIModel:
             'rsi_14', 'macd_main', 'macd_signal', 
             'bb_upper', 'bb_middle', 'bb_lower', 'atr_14',
             'stoch_main', 'stoch_signal',
-            'price_momentum_5', 'price_momentum_10', 'price_momentum_20',
+            'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
             'volatility_ratio', 'trend_strength', 'volume_ratio',
             'hour_of_day', 'day_of_week', 'session_encoded'
         ]
@@ -377,7 +377,9 @@ class PredictionWriter:
             self.supabase.table('model_versions').upsert(record).execute()
             print(f"✅ Model version saved: {self.config.MODEL_VERSION}")
         except Exception as e:
-            print(f"❌ Error saving model version: {e}")
+            # Ignore duplicate key errors
+            if 'duplicate key' not in str(e).lower():
+                print(f"⚠️ Note: {e}")
 
 # ================================================================
 # 5. MAIN PIPELINE
@@ -391,6 +393,52 @@ class TradingPipeline:
         self.model = AIModel(config)
         self.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
         self.writer = PredictionWriter(config, self.supabase)
+    
+    def has_new_data(self, symbol: str) -> bool:
+        """Check if there's new data since last prediction"""
+        try:
+            # Get latest prediction timestamp
+            pred_response = self.supabase.table('predictions')\
+                .select('timestamp')\
+                .eq('symbol', symbol)\
+                .order('timestamp', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            # Get latest OHLC timestamp
+            ohlc_response = self.supabase.table('market_data_ohlc')\
+                .select('timestamp')\
+                .eq('symbol', symbol)\
+                .eq('timeframe', self.config.TIMEFRAME)\
+                .order('timestamp', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if not ohlc_response.data:
+                print(f"   ⚠️ {symbol}: No OHLC data found")
+                return False
+            
+            latest_ohlc_time = pd.to_datetime(ohlc_response.data[0]['timestamp'])
+            
+            # Kalau belum pernah ada prediction, generate
+            if not pred_response.data:
+                print(f"   ✅ {symbol}: No previous predictions - will generate")
+                return True
+            
+            latest_pred_time = pd.to_datetime(pred_response.data[0]['timestamp'])
+            
+            # Ada data baru kalau OHLC timestamp lebih baru
+            if latest_ohlc_time > latest_pred_time:
+                time_diff = (latest_ohlc_time - latest_pred_time).total_seconds() / 3600
+                print(f"   ✅ {symbol}: New data detected ({time_diff:.1f} hours newer)")
+                return True
+            else:
+                print(f"   ⏭️  {symbol}: No new data - skipping")
+                return False
+                
+        except Exception as e:
+            print(f"   ❌ {symbol}: Error checking data - {e}")
+            return False
     
     def run_training(self, symbol: str):
         """Complete training pipeline for one symbol"""
@@ -410,7 +458,7 @@ class TradingPipeline:
         df = self.engineer.merge_data(ohlc, indicators)
         df = self.engineer.create_features(df)
         
-        if len(df) < 100:
+        if len(df) < 50:
             print(f"❌ Not enough data after feature engineering: {len(df)} records")
             return None
         
@@ -430,7 +478,7 @@ class TradingPipeline:
         """Generate prediction for current market state"""
         print(f"\n📊 Generating prediction for {symbol}...")
         
-        # Load latest data (last 5 records for feature calculation)
+        # Load latest data
         ohlc = self.loader.load_ohlc_data(symbol, days=2)
         indicators = self.loader.load_indicators(symbol, days=2)
         
@@ -467,42 +515,76 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
     ║          AI TRADING SYSTEM - PYTHON PIPELINE              ║
-    ║        Data → Features → Train → Predict → Save          ║
+    ║   Data → Features → Train → Predict → Save (v1.1)        ║
+    ║          Only processes symbols with NEW data             ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
     config = Config()
     pipeline = TradingPipeline(config)
     
-    # STEP 1: Train models for all symbols
-    print("\n🚀 STEP 1: TRAINING MODELS\n")
+    # STEP 1: Check which symbols have new data
+    print("\n🔍 STEP 1: CHECKING FOR NEW DATA")
+    print("="*60)
     
+    symbols_to_process = []
     for symbol in config.SYMBOLS:
+        if pipeline.has_new_data(symbol):
+            symbols_to_process.append(symbol)
+    
+    print("="*60)
+    
+    if not symbols_to_process:
+        print("\n⏭️  NO NEW DATA for any symbol")
+        print("   System will skip training and predictions")
+        print("   Next automatic check in 1 hour")
+        print("\n" + "="*60)
+        print("✅ PIPELINE COMPLETED (No action needed)")
+        print("="*60)
+        return
+    
+    print(f"\n📊 Found NEW DATA for {len(symbols_to_process)} symbol(s):")
+    print(f"   {', '.join(symbols_to_process)}")
+    
+    # STEP 2: Train models for symbols with new data
+    print("\n🚀 STEP 2: TRAINING MODELS")
+    print("="*60)
+    
+    trained_symbols = []
+    for symbol in symbols_to_process:
         try:
             model = pipeline.run_training(symbol)
             if model:
                 print(f"✅ {symbol} training completed\n")
+                trained_symbols.append(symbol)
             else:
                 print(f"⚠️ {symbol} training skipped\n")
         except Exception as e:
             print(f"❌ Error training {symbol}: {e}\n")
     
-    # STEP 2: Generate predictions for all symbols
-    print("\n🔮 STEP 2: GENERATING PREDICTIONS\n")
-    
-    for symbol in config.SYMBOLS:
-        try:
-            pipeline.run_prediction(symbol)
-        except Exception as e:
-            print(f"❌ Error predicting {symbol}: {e}")
+    # STEP 3: Generate predictions for trained symbols
+    if trained_symbols:
+        print("\n🔮 STEP 3: GENERATING PREDICTIONS")
+        print("="*60)
+        
+        for symbol in trained_symbols:
+            try:
+                pipeline.run_prediction(symbol)
+            except Exception as e:
+                print(f"❌ Error predicting {symbol}: {e}")
     
     print("\n" + "="*60)
     print("✅ PIPELINE COMPLETED!")
     print("="*60)
-    print("\n📌 Next steps:")
+    print(f"\n📌 Summary:")
+    print(f"   • Checked: {len(config.SYMBOLS)} symbols")
+    print(f"   • Found new data: {len(symbols_to_process)} symbols")
+    print(f"   • Trained models: {len(trained_symbols)} symbols")
+    print(f"   • Generated predictions: {len(trained_symbols)} symbols")
+    print("\n   Next steps:")
     print("   1. Check 'predictions' table in Supabase")
-    print("   2. Enable ENABLE_TRADING in your EA")
-    print("   3. EA will read predictions and execute trades")
+    print("   2. EA will read predictions and execute trades")
+    print("   3. Next automatic check in 1 hour")
     print("\n")
 
 if __name__ == "__main__":
