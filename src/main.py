@@ -41,9 +41,9 @@ class Config:
     SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD']
     TIMEFRAME = 'H1'
     
-    # Feature engineering
-    MOMENTUM_PERIODS = [5, 10, 20]
-    VOLATILITY_WINDOW = 20
+   # Feature engineering - REDUCED untuk data yang masih sedikit
+    MOMENTUM_PERIODS = [3, 5, 10]  # Dari [5,10,20] jadi [3,5,10]
+    VOLATILITY_WINDOW = 10  # Dari 20 jadi 10
     
     # Training
     TEST_SIZE = 0.2
