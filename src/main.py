@@ -477,10 +477,10 @@ class TradingPipeline:
     def run_prediction(self, symbol: str):
         """Generate prediction for current market state"""
         print(f"\n📊 Generating prediction for {symbol}...")
-        
-        # Load latest data
-        ohlc = self.loader.load_ohlc_data(symbol, days=2)
-        indicators = self.loader.load_indicators(symbol, days=2)
+    
+        # Load latest data - need more for rolling window calculations
+        ohlc = self.loader.load_ohlc_data(symbol, days=5)  # ← 5 hari = ~120 records
+        indicators = self.loader.load_indicators(symbol, days=5)
         
         if ohlc.empty or indicators.empty:
             print(f"❌ No recent data for {symbol}")
