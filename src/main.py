@@ -36,7 +36,7 @@ class Config:
     LOOKBACK_DAYS = 30  # How many days of historical data to use
     
     # Trading logic
-    PREDICTION_THRESHOLD = 0.65  # Minimum confidence for signal
+    PREDICTION_THRESHOLD = 0.50  # Minimum confidence for signal
     SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
                'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'XAUUSD']
     TIMEFRAME = 'H1'
