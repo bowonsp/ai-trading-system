@@ -1,10 +1,11 @@
 """
 AI Trading System - Complete Python Pipeline
 Reads data from Supabase → Trains AI → Writes predictions back
-Version 1.1 - With New Data Detection (Only train when new data arrives)
+Version 1.2 - With Unix Timestamp (Timezone Fix)
 """
 
 import os
+import time  # ← ADDED for Unix timestamp
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -31,7 +32,7 @@ class Config:
     SUPABASE_KEY = os.getenv('SUPABASE_KEY', '')
     
     # Model settings
-    MODEL_VERSION = "v1.0.0"
+    MODEL_VERSION = "v1.2.0"  # ← Updated version
     LOOKBACK_DAYS = 30  # How many days of historical data to use
     
     # Trading logic
@@ -346,10 +347,11 @@ class PredictionWriter:
         self.supabase = supabase
     
     def save_prediction(self, symbol: str, signal: str, confidence: float):
-        """Save single prediction to database"""
+        """Save single prediction to database with Unix timestamp"""
         try:
             record = {
                 'timestamp': datetime.utcnow().isoformat(),
+                'timestamp_unix': int(time.time()),  # ← ADDED: Unix timestamp for timezone sync
                 'symbol': symbol,
                 'model_version': self.config.MODEL_VERSION,
                 'prediction': signal,
@@ -515,8 +517,8 @@ def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
     ║          AI TRADING SYSTEM - PYTHON PIPELINE              ║
-    ║   Data → Features → Train → Predict → Save (v1.1)        ║
-    ║          Only processes symbols with NEW data             ║
+    ║   Data → Features → Train → Predict → Save (v1.2)        ║
+    ║     WITH UNIX TIMESTAMP - Timezone Independent            ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
@@ -585,6 +587,7 @@ def main():
     print("   1. Check 'predictions' table in Supabase")
     print("   2. EA will read predictions and execute trades")
     print("   3. Next automatic check in 1 hour")
+    print("\n   ℹ️  Version 1.2 - Unix timestamp for timezone sync")
     print("\n")
 
 if __name__ == "__main__":
