@@ -521,7 +521,8 @@ def main():
     
     trained_models = {}
     
-    for symbol in config.SYMBOLS[:3]:
+    # Process ALL 10 symbols (change to [:3] for testing)
+    for symbol in config.SYMBOLS:
         try:
             model = pipeline.run_training(symbol)
             if model:
