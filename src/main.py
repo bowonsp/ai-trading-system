@@ -1,438 +1,594 @@
-#!/usr/bin/env python3
 """
-AI Trading Pipeline v2.1 - CONTINUOUS LEARNING
-Features:
-1. Model persistence (save/load)
-2. Incremental training
-3. Performance tracking
-4. Gradual improvement
+AI Trading System - Complete Python Pipeline
+Reads data from Supabase → Trains AI → Writes predictions back
+Version 1.2 - With Unix Timestamp (Timezone Fix)
 """
 
-import pandas as pd
-import numpy as np
-from datetime import datetime, timezone, timedelta
-import MetaTrader5 as mt5
-from supabase import create_client
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-import pickle
 import os
+import time  # ← ADDED for Unix timestamp
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
-# ============================================================================
+# ML Libraries
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report
+
+# Supabase
+from supabase import create_client, Client
+
+# ================================================================
 # CONFIGURATION
-# ============================================================================
+# ================================================================
 
-# Paths
-MODEL_PATH = "trading_model_v2.h5"
-SCALER_PATH = "scaler_v2.pkl"
-METRICS_PATH = "model_metrics.json"
+class Config:
+    # Supabase credentials - baca dari environment variable
+    SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://kktfrmvwzykkzosvzddn.supabase.co')
+    SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtrdGZybXZ3enlra3pvc3Z6ZGRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzgwNjc1MywiZXhwIjoyMDgzMzgyNzUzfQ.2OUwg8dQYaAjNDMHeUKXWxFeUm_ipxZgqx8x5RDcIU8')
+    
+    # Model settings
+    MODEL_VERSION = "v1.2.0"  # ← Updated version
+    LOOKBACK_DAYS = 30  # How many days of historical data to use
+    
+    # Trading logic
+    PREDICTION_THRESHOLD = 0.65  # Minimum confidence for signal
+    SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
+               'USDCAD', 'NZDUSD', 'EURGBP', 'EURJPY', 'XAUUSD']
+    TIMEFRAME = 'H1'
+    
+    # Feature engineering - REDUCED untuk data yang masih sedikit
+    MOMENTUM_PERIODS = [3, 5, 10]
+    VOLATILITY_WINDOW = 10
+    
+    # Training
+    TEST_SIZE = 0.2
+    RANDOM_STATE = 42
 
-# Supabase Configuration
-SUPABASE_URL = "https://kktfrmvwzykkzosvzddn.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtrdGZybXZ3enlra3pvc3Z6ZGRuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg3MTczNzAsImV4cCI6MjA4NDI5MzM3MH0.Cr16JZvwQx_MrW-Gh-S-p_mLTCTnMMqTFMJk40J8F5g"
+# ================================================================
+# 1. DATA LOADER - Read from Supabase
+# ================================================================
 
-# MT5 Configuration
-MT5_LOGIN = 104492090
-MT5_PASSWORD = "Ug.9vEPg"
-MT5_SERVER = "FBSMarkets-Demo"
-
-# Model Configuration
-MODEL_VERSION = "v2.1.0"
-PREDICTION_THRESHOLD = 0.70
-RETRAIN_EPOCHS = 20  # Fewer epochs for fine-tuning
-FULL_TRAIN_EPOCHS = 100  # Full training from scratch
-BATCH_SIZE = 32
-
-# Trading Pairs
-SYMBOLS = [
-    'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'NZDUSD',
-    'USDCAD', 'USDCHF', 'EURJPY', 'GBPJPY', 'EURGBP', 'XAUUSD'
-]
-
-# ============================================================================
-# SUPABASE CLIENT
-# ============================================================================
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ============================================================================
-# MODEL PERSISTENCE
-# ============================================================================
-
-def save_model_and_scaler(model, scaler):
-    """Save model and scaler to disk"""
-    model.save(MODEL_PATH)
-    with open(SCALER_PATH, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"💾 Model saved to {MODEL_PATH}")
-
-def load_model_and_scaler():
-    """Load existing model and scaler"""
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        model = load_model(MODEL_PATH)
-        with open(SCALER_PATH, 'rb') as f:
-            scaler = pickle.load(f)
-        print(f"📂 Loaded existing model from {MODEL_PATH}")
-        return model, scaler
-    return None, None
-
-# ============================================================================
-# MT5 CONNECTION
-# ============================================================================
-
-def connect_mt5():
-    """Connect to MetaTrader 5"""
-    if not mt5.initialize():
-        print(f"❌ MT5 initialization failed: {mt5.last_error()}")
-        return False
+class DataLoader:
+    def __init__(self, config: Config):
+        self.config = config
+        self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
     
-    if not mt5.login(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER):
-        print(f"❌ MT5 login failed: {mt5.last_error()}")
-        mt5.shutdown()
-        return False
-    
-    print(f"✅ Connected to MT5: {mt5.account_info().login}")
-    return True
-
-# ============================================================================
-# DATA FETCHING & FEATURES (same as v2.0)
-# ============================================================================
-
-def fetch_ohlc_data(symbol, timeframe=mt5.TIMEFRAME_H1, periods=500):
-    """Fetch OHLC data from MT5"""
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, periods)
-    
-    if rates is None or len(rates) == 0:
-        return None
-    
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    return df
-
-def calculate_features(df):
-    """Calculate technical indicators"""
-    # (Same as v2.0 - full feature engineering code)
-    # Price changes
-    df['returns'] = df['close'].pct_change()
-    df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
-    
-    # Moving Averages
-    df['sma_5'] = df['close'].rolling(window=5).mean()
-    df['sma_10'] = df['close'].rolling(window=10).mean()
-    df['sma_20'] = df['close'].rolling(window=20).mean()
-    df['sma_50'] = df['close'].rolling(window=50).mean()
-    
-    df['ema_5'] = df['close'].ewm(span=5).mean()
-    df['ema_10'] = df['close'].ewm(span=10).mean()
-    df['ema_20'] = df['close'].ewm(span=20).mean()
-    
-    # Crossovers
-    df['sma_cross_5_10'] = (df['sma_5'] - df['sma_10']) / df['close']
-    df['sma_cross_10_20'] = (df['sma_10'] - df['sma_20']) / df['close']
-    
-    # RSI
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    df['rsi_normalized'] = (df['rsi'] - 50) / 50
-    
-    # MACD
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = exp1 - exp2
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    df['macd_hist'] = df['macd'] - df['macd_signal']
-    df['macd_normalized'] = df['macd_hist'] / df['close']
-    
-    # Bollinger Bands
-    df['bb_middle'] = df['close'].rolling(window=20).mean()
-    df['bb_std'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
-    df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
-    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
-    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-    
-    # ATR
-    df['tr1'] = df['high'] - df['low']
-    df['tr2'] = abs(df['high'] - df['close'].shift())
-    df['tr3'] = abs(df['low'] - df['close'].shift())
-    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-    df['atr'] = df['tr'].rolling(window=14).mean()
-    df['atr_normalized'] = df['atr'] / df['close']
-    
-    # Momentum
-    df['momentum_5'] = df['close'] / df['close'].shift(5) - 1
-    df['momentum_10'] = df['close'] / df['close'].shift(10) - 1
-    
-    return df
-
-def create_labels(df, forward_periods=5, threshold=0.001):
-    """Create labels"""
-    df['future_price'] = df['close'].shift(-forward_periods)
-    df['price_change'] = (df['future_price'] - df['close']) / df['close']
-    
-    df['label'] = 1  # HOLD
-    df.loc[df['price_change'] > threshold, 'label'] = 2  # BUY
-    df.loc[df['price_change'] < -threshold, 'label'] = 0  # SELL
-    
-    return df
-
-# ============================================================================
-# MODEL BUILDING
-# ============================================================================
-
-def build_improved_model(input_shape):
-    """Build improved model"""
-    model = Sequential([
-        Dense(256, activation='relu', input_shape=(input_shape,),
-              kernel_regularizer=keras.regularizers.l2(0.001)),
-        BatchNormalization(),
-        Dropout(0.3),
-        
-        Dense(128, activation='relu',
-              kernel_regularizer=keras.regularizers.l2(0.001)),
-        BatchNormalization(),
-        Dropout(0.3),
-        
-        Dense(64, activation='relu',
-              kernel_regularizer=keras.regularizers.l2(0.001)),
-        BatchNormalization(),
-        Dropout(0.2),
-        
-        Dense(32, activation='relu',
-              kernel_regularizer=keras.regularizers.l2(0.001)),
-        BatchNormalization(),
-        Dropout(0.2),
-        
-        Dense(3, activation='softmax')
-    ])
-    
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss='sparse_categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    return model
-
-# ============================================================================
-# TRAINING WITH PERSISTENCE
-# ============================================================================
-
-def train_or_finetune(X, y, existing_model=None):
-    """Train new model or fine-tune existing one"""
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    
-    print(f"\n📊 Dataset: {len(X_train)} train, {len(X_val)} validation")
-    
-    # Class weights
-    class_weights = compute_class_weight(
-        class_weight='balanced',
-        classes=np.unique(y_train),
-        y=y_train
-    )
-    class_weight_dict = dict(enumerate(class_weights))
-    
-    # Decide: new model or fine-tune
-    if existing_model is not None:
-        print("🔄 Fine-tuning existing model...")
-        model = existing_model
-        epochs = RETRAIN_EPOCHS
-        learning_rate = 0.0001  # Lower LR for fine-tuning
-        
-        # Update learning rate
-        keras.backend.set_value(model.optimizer.learning_rate, learning_rate)
-    else:
-        print("🆕 Training new model from scratch...")
-        model = build_improved_model(X_train.shape[1])
-        epochs = FULL_TRAIN_EPOCHS
-    
-    # Callbacks
-    early_stop = EarlyStopping(
-        monitor='val_loss',
-        patience=15 if existing_model is None else 5,
-        restore_best_weights=True,
-        verbose=1
-    )
-    
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=5 if existing_model is None else 3,
-        min_lr=0.00001,
-        verbose=1
-    )
-    
-    # Train
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=BATCH_SIZE,
-        class_weight=class_weight_dict,
-        callbacks=[early_stop, reduce_lr],
-        verbose=1
-    )
-    
-    # Evaluate
-    train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
-    val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
-    
-    print(f"\n📈 Performance:")
-    print(f"   Training: {train_acc*100:.2f}%")
-    print(f"   Validation: {val_acc*100:.2f}%")
-    print(f"   Gap: {(train_acc - val_acc)*100:.2f}%")
-    
-    if train_acc - val_acc > 0.15:
-        print(f"   ⚠️ Overfitting detected!")
-    
-    return model
-
-# ============================================================================
-# PREDICTION
-# ============================================================================
-
-def make_predictions(model, scaler, symbol, df):
-    """Make predictions"""
-    feature_cols = [col for col in df.columns if col not in 
-                    ['time', 'label', 'future_price', 'price_change', 
-                     'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume',
-                     'tr1', 'tr2', 'tr3', 'tr']]
-    
-    X = df[feature_cols].values
-    X_scaled = scaler.transform(X)
-    
-    predictions = model.predict(X_scaled, verbose=0)
-    latest_pred = predictions[-1]
-    pred_class = np.argmax(latest_pred)
-    confidence = latest_pred[pred_class]
-    
-    signal_map = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
-    signal = signal_map[pred_class]
-    
-    if confidence >= PREDICTION_THRESHOLD and signal != 'HOLD':
-        now_utc = datetime.now(timezone.utc)
-        timestamp_unix = int(now_utc.timestamp())
-        
-        data = {
-            'timestamp': now_utc.isoformat(),
-            'timestamp_unix': timestamp_unix,
-            'symbol': symbol,
-            'prediction': signal,
-            'confidence': float(confidence),
-            'model_version': MODEL_VERSION
-        }
+    def load_ohlc_data(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """Load OHLC data from Supabase"""
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
         
         try:
-            supabase.table('predictions').insert(data).execute()
-            print(f"   ✅ {symbol}: {signal} ({confidence*100:.1f}%)")
-            return True
+            response = self.supabase.table('market_data_ohlc')\
+                .select('*')\
+                .eq('symbol', symbol)\
+                .eq('timeframe', self.config.TIMEFRAME)\
+                .gte('timestamp', start_date.isoformat())\
+                .order('timestamp', desc=False)\
+                .execute()
+            
+            if response.data:
+                df = pd.DataFrame(response.data)
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Loaded {len(df)} OHLC records for {symbol}")
+                return df
+            else:
+                print(f"⚠️ No OHLC data found for {symbol}")
+                return pd.DataFrame()
         except Exception as e:
-            print(f"   ❌ {symbol}: {e}")
-            return False
-    else:
-        print(f"   ⏭️ {symbol}: Skipped ({confidence*100:.1f}%)")
-        return False
+            print(f"❌ Error loading OHLC: {e}")
+            return pd.DataFrame()
+    
+    def load_indicators(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """Load indicators from Supabase"""
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days)
+        
+        try:
+            response = self.supabase.table('indicators')\
+                .select('*')\
+                .eq('symbol', symbol)\
+                .eq('timeframe', self.config.TIMEFRAME)\
+                .gte('timestamp', start_date.isoformat())\
+                .order('timestamp', desc=False)\
+                .execute()
+            
+            if response.data:
+                df = pd.DataFrame(response.data)
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.sort_values('timestamp').reset_index(drop=True)
+                print(f"✅ Loaded {len(df)} indicator records for {symbol}")
+                return df
+            else:
+                print(f"⚠️ No indicator data found for {symbol}")
+                return pd.DataFrame()
+        except Exception as e:
+            print(f"❌ Error loading indicators: {e}")
+            return pd.DataFrame()
 
-# ============================================================================
-# MAIN
-# ============================================================================
+# ================================================================
+# 2. FEATURE ENGINEER - Create ML Features
+# ================================================================
+
+class FeatureEngineer:
+    def __init__(self, config: Config):
+        self.config = config
+    
+    def merge_data(self, ohlc: pd.DataFrame, indicators: pd.DataFrame) -> pd.DataFrame:
+        """Merge OHLC and indicators on timestamp"""
+        if ohlc.empty or indicators.empty:
+            return pd.DataFrame()
+        
+        # Merge on timestamp
+        df = pd.merge(ohlc, indicators, on=['timestamp', 'symbol', 'timeframe'], how='inner')
+        print(f"✅ Merged dataset: {len(df)} records")
+        return df
+    
+    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Engineer ML features from raw data"""
+        if df.empty:
+            return df
+        
+        print("🔧 Engineering features...")
+        
+        # Price momentum features
+        for period in self.config.MOMENTUM_PERIODS:
+            df[f'price_momentum_{period}'] = df['close'].pct_change(period) * 100
+        
+        # Volatility
+        df['volatility_ratio'] = df['atr_14'] / df['close']
+        
+        # Trend strength (using MACD)
+        df['trend_strength'] = abs(df['macd_main'] - df['macd_signal'])
+        
+        # Volume ratio
+        df['volume_ratio'] = df['volume'] / df['volume'].rolling(self.config.VOLATILITY_WINDOW).mean()
+        
+        # Time-based features
+        df['hour_of_day'] = df['timestamp'].dt.hour
+        df['day_of_week'] = df['timestamp'].dt.dayofweek
+        
+        # Trading session (simplified)
+        df['session'] = df['hour_of_day'].apply(self._get_session)
+        df['session_encoded'] = df['session'].map({'asian': 0, 'european': 1, 'us': 2, 'other': 3})
+        
+        # Target variable: Future return
+        df['future_return_1h'] = df['close'].shift(-1) / df['close'] - 1
+        df['future_return_4h'] = df['close'].shift(-4) / df['close'] - 1
+        
+        # Binary classification targets
+        df['profitable_long'] = (df['future_return_1h'] > 0.0002).astype(int)  # >2 pips
+        df['profitable_short'] = (df['future_return_1h'] < -0.0002).astype(int)
+        
+        # Drop NaN hanya di kolom yang penting untuk training
+        important_cols = [
+            'close', 'volume', 'rsi_14', 'macd_main', 'macd_signal',
+            'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
+            'volatility_ratio', 'trend_strength', 'volume_ratio',
+            'hour_of_day', 'day_of_week', 'session_encoded',
+            'future_return_1h', 'profitable_long', 'profitable_short'
+        ]
+        
+        # Drop hanya baris yang ada NaN di kolom penting
+        existing_cols = [col for col in important_cols if col in df.columns]
+        df = df.dropna(subset=existing_cols)
+        
+        print(f"✅ Features created: {len(df)} complete records")
+        return df
+    
+    def _get_session(self, hour: int) -> str:
+        """Determine trading session based on hour (UTC)"""
+        if 0 <= hour < 7:
+            return 'asian'
+        elif 7 <= hour < 15:
+            return 'european'
+        elif 15 <= hour < 21:
+            return 'us'
+        else:
+            return 'other'
+    
+    def save_features_to_db(self, df: pd.DataFrame, supabase: Client):
+        """Save engineered features to ml_features table"""
+        if df.empty:
+            return
+        
+        print("💾 Saving features to database...")
+        
+        records = []
+        for _, row in df.iterrows():
+            record = {
+                'timestamp': row['timestamp'].isoformat(),
+                'symbol': row['symbol'],
+                'timeframe': row['timeframe'],
+                'price_momentum_5': float(row.get('price_momentum_5', 0)),
+                'price_momentum_20': float(row.get('price_momentum_20', 0)),
+                'volatility_ratio': float(row.get('volatility_ratio', 0)),
+                'trend_strength': float(row.get('trend_strength', 0)),
+                'volume_ratio': float(row.get('volume_ratio', 0)),
+                'hour_of_day': int(row['hour_of_day']),
+                'day_of_week': int(row['day_of_week']),
+                'session': row['session'],
+                'future_return_1h': float(row.get('future_return_1h', 0)),
+                'future_return_4h': float(row.get('future_return_4h', 0)),
+                'profitable_long': bool(row.get('profitable_long', False)),
+                'profitable_short': bool(row.get('profitable_short', False))
+            }
+            records.append(record)
+        
+        try:
+            # Insert in batches
+            batch_size = 100
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i+batch_size]
+                supabase.table('ml_features').upsert(batch).execute()
+            
+            print(f"✅ Saved {len(records)} feature records to database")
+        except Exception as e:
+            print(f"⚠️ Note: {e}")
+
+# ================================================================
+# 3. AI MODEL - Train and Predict
+# ================================================================
+
+class AIModel:
+    def __init__(self, config: Config):
+        self.config = config
+        self.model = None
+        self.scaler = StandardScaler()
+        self.feature_columns = []
+        self.metrics = {}
+    
+    def prepare_training_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """Prepare features and target for training"""
+        # Select features
+        self.feature_columns = [
+            'open', 'high', 'low', 'close', 'volume',
+            'rsi_14', 'macd_main', 'macd_signal', 
+            'bb_upper', 'bb_middle', 'bb_lower', 'atr_14',
+            'stoch_main', 'stoch_signal',
+            'price_momentum_3', 'price_momentum_5', 'price_momentum_10',
+            'volatility_ratio', 'trend_strength', 'volume_ratio',
+            'hour_of_day', 'day_of_week', 'session_encoded'
+        ]
+        
+        # Filter available columns
+        available_cols = [col for col in self.feature_columns if col in df.columns]
+        
+        X = df[available_cols].values
+        
+        # Create multi-class target: 0=SELL, 1=HOLD, 2=BUY
+        y = np.zeros(len(df))
+        y[df['profitable_long'] == 1] = 2  # BUY
+        y[df['profitable_short'] == 1] = 0  # SELL
+        # Rest remains 1 (HOLD)
+        
+        self.feature_columns = available_cols
+        return X, y
+    
+    def train(self, X: np.ndarray, y: np.ndarray):
+        """Train the AI model"""
+        print("🤖 Training AI model...")
+        
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
+        )
+        
+        # Scale features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Train model (Random Forest)
+        self.model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=10,
+            random_state=self.config.RANDOM_STATE,
+            n_jobs=-1
+        )
+        
+        self.model.fit(X_train_scaled, y_train)
+        
+        # Evaluate
+        train_acc = accuracy_score(y_train, self.model.predict(X_train_scaled))
+        test_acc = accuracy_score(y_test, self.model.predict(X_test_scaled))
+        
+        self.metrics = {
+            'train_accuracy': train_acc,
+            'test_accuracy': test_acc,
+            'train_samples': len(y_train),
+            'test_samples': len(y_test)
+        }
+        
+        print(f"✅ Model trained!")
+        print(f"   Train accuracy: {train_acc:.4f}")
+        print(f"   Test accuracy:  {test_acc:.4f}")
+        
+        return self.model
+    
+    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Make predictions with confidence scores"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        X_scaled = self.scaler.transform(X)
+        predictions = self.model.predict(X_scaled)
+        probabilities = self.model.predict_proba(X_scaled)
+        
+        # Get confidence (max probability)
+        confidence = np.max(probabilities, axis=1)
+        
+        return predictions, confidence
+    
+    def get_signal(self, prediction: int, confidence: float) -> str:
+        """Convert prediction to trading signal"""
+        if confidence < self.config.PREDICTION_THRESHOLD:
+            return 'HOLD'
+        
+        if prediction == 2:
+            return 'BUY'
+        elif prediction == 0:
+            return 'SELL'
+        else:
+            return 'HOLD'
+
+# ================================================================
+# 4. PREDICTION WRITER - Save predictions to Supabase
+# ================================================================
+
+class PredictionWriter:
+    def __init__(self, config: Config, supabase: Client):
+        self.config = config
+        self.supabase = supabase
+    
+    def save_prediction(self, symbol: str, signal: str, confidence: float):
+        """Save single prediction to database with Unix timestamp"""
+        try:
+            record = {
+                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp_unix': int(time.time()),  # ← ADDED: Unix timestamp for timezone sync
+                'symbol': symbol,
+                'model_version': self.config.MODEL_VERSION,
+                'prediction': signal,
+                'confidence': float(confidence),
+                'executed': False
+            }
+            
+            self.supabase.table('predictions').insert(record).execute()
+            print(f"✅ Prediction saved: {symbol} → {signal} ({confidence:.2%})")
+        except Exception as e:
+            print(f"❌ Error saving prediction: {e}")
+    
+    def save_model_version(self, metrics: Dict):
+        """Save model version info"""
+        try:
+            record = {
+                'version': self.config.MODEL_VERSION,
+                'model_type': 'RandomForest',
+                'train_accuracy': float(metrics.get('train_accuracy', 0)),
+                'val_accuracy': 0.0,
+                'test_accuracy': float(metrics.get('test_accuracy', 0)),
+                'is_active': True
+            }
+            
+            self.supabase.table('model_versions').upsert(record).execute()
+            print(f"✅ Model version saved: {self.config.MODEL_VERSION}")
+        except Exception as e:
+            # Ignore duplicate key errors
+            if 'duplicate key' not in str(e).lower():
+                print(f"⚠️ Note: {e}")
+
+# ================================================================
+# 5. MAIN PIPELINE
+# ================================================================
+
+class TradingPipeline:
+    def __init__(self, config: Config):
+        self.config = config
+        self.loader = DataLoader(config)
+        self.engineer = FeatureEngineer(config)
+        self.model = AIModel(config)
+        self.supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+        self.writer = PredictionWriter(config, self.supabase)
+    
+    def has_new_data(self, symbol: str) -> bool:
+        """Check if there's new data since last prediction"""
+        try:
+            # Get latest prediction timestamp
+            pred_response = self.supabase.table('predictions')\
+                .select('timestamp')\
+                .eq('symbol', symbol)\
+                .order('timestamp', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            # Get latest OHLC timestamp
+            ohlc_response = self.supabase.table('market_data_ohlc')\
+                .select('timestamp')\
+                .eq('symbol', symbol)\
+                .eq('timeframe', self.config.TIMEFRAME)\
+                .order('timestamp', desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if not ohlc_response.data:
+                print(f"   ⚠️ {symbol}: No OHLC data found")
+                return False
+            
+            latest_ohlc_time = pd.to_datetime(ohlc_response.data[0]['timestamp'])
+            
+            # Kalau belum pernah ada prediction, generate
+            if not pred_response.data:
+                print(f"   ✅ {symbol}: No previous predictions - will generate")
+                return True
+            
+            latest_pred_time = pd.to_datetime(pred_response.data[0]['timestamp'])
+            
+            # Ada data baru kalau OHLC timestamp lebih baru
+            if latest_ohlc_time > latest_pred_time:
+                time_diff = (latest_ohlc_time - latest_pred_time).total_seconds() / 3600
+                print(f"   ✅ {symbol}: New data detected ({time_diff:.1f} hours newer)")
+                return True
+            else:
+                print(f"   ⏭️  {symbol}: No new data - skipping")
+                return False
+                
+        except Exception as e:
+            print(f"   ❌ {symbol}: Error checking data - {e}")
+            return False
+    
+    def run_training(self, symbol: str):
+        """Complete training pipeline for one symbol"""
+        print(f"\n{'='*60}")
+        print(f"TRAINING PIPELINE: {symbol}")
+        print(f"{'='*60}\n")
+        
+        # 1. Load data
+        ohlc = self.loader.load_ohlc_data(symbol, days=self.config.LOOKBACK_DAYS)
+        indicators = self.loader.load_indicators(symbol, days=self.config.LOOKBACK_DAYS)
+        
+        if ohlc.empty or indicators.empty:
+            print(f"❌ Insufficient data for {symbol}")
+            return None
+        
+        # 2. Merge and engineer features
+        df = self.engineer.merge_data(ohlc, indicators)
+        df = self.engineer.create_features(df)
+        
+        if len(df) < 50:
+            print(f"❌ Not enough data after feature engineering: {len(df)} records")
+            return None
+        
+        # 3. Save features to database
+        self.engineer.save_features_to_db(df, self.supabase)
+        
+        # 4. Train model
+        X, y = self.model.prepare_training_data(df)
+        self.model.train(X, y)
+        
+        # 5. Save model version
+        self.writer.save_model_version(self.model.metrics)
+        
+        return self.model
+    
+    def run_prediction(self, symbol: str):
+        """Generate prediction for current market state"""
+        print(f"\n📊 Generating prediction for {symbol}...")
+    
+        # Load latest data - need more for rolling window calculations
+        ohlc = self.loader.load_ohlc_data(symbol, days=5)  # ← 5 hari = ~120 records
+        indicators = self.loader.load_indicators(symbol, days=5)
+        
+        if ohlc.empty or indicators.empty:
+            print(f"❌ No recent data for {symbol}")
+            return
+        
+        # Merge and engineer features
+        df = self.engineer.merge_data(ohlc, indicators)
+        df = self.engineer.create_features(df)
+        
+        if df.empty:
+            print(f"❌ Failed to create features for {symbol}")
+            return
+        
+        # Get latest record
+        latest = df.iloc[-1]
+        X_latest = latest[self.model.feature_columns].values.reshape(1, -1)
+        
+        # Predict
+        prediction, confidence = self.model.predict(X_latest)
+        signal = self.model.get_signal(prediction[0], confidence[0])
+        
+        # Save to database
+        self.writer.save_prediction(symbol, signal, confidence[0])
+        
+        print(f"   Signal: {signal} | Confidence: {confidence[0]:.2%}")
+
+# ================================================================
+# 6. MAIN EXECUTION
+# ================================================================
 
 def main():
-    """Main execution with continuous learning"""
+    print("""
+    ╔═══════════════════════════════════════════════════════════╗
+    ║          AI TRADING SYSTEM - PYTHON PIPELINE              ║
+    ║   Data → Features → Train → Predict → Save (v1.2)        ║
+    ║     WITH UNIX TIMESTAMP - Timezone Independent            ║
+    ╚═══════════════════════════════════════════════════════════╝
+    """)
+    
+    config = Config()
+    pipeline = TradingPipeline(config)
+    
+    # STEP 1: Check which symbols have new data
+    print("\n🔍 STEP 1: CHECKING FOR NEW DATA")
+    print("="*60)
+    
+    symbols_to_process = []
+    for symbol in config.SYMBOLS:
+        if pipeline.has_new_data(symbol):
+            symbols_to_process.append(symbol)
     
     print("="*60)
-    print("🤖 AI Trading Pipeline v2.1 - CONTINUOUS LEARNING")
+    
+    if not symbols_to_process:
+        print("\n⏭️  NO NEW DATA for any symbol")
+        print("   System will skip training and predictions")
+        print("   Next automatic check in 1 hour")
+        print("\n" + "="*60)
+        print("✅ PIPELINE COMPLETED (No action needed)")
+        print("="*60)
+        return
+    
+    print(f"\n📊 Found NEW DATA for {len(symbols_to_process)} symbol(s):")
+    print(f"   {', '.join(symbols_to_process)}")
+    
+    # STEP 2: Train models for symbols with new data
+    print("\n🚀 STEP 2: TRAINING MODELS")
     print("="*60)
     
-    # Connect MT5
-    if not connect_mt5():
-        return
+    trained_symbols = []
+    for symbol in symbols_to_process:
+        try:
+            model = pipeline.run_training(symbol)
+            if model:
+                print(f"✅ {symbol} training completed\n")
+                trained_symbols.append(symbol)
+            else:
+                print(f"⚠️ {symbol} training skipped\n")
+        except Exception as e:
+            print(f"❌ Error training {symbol}: {e}\n")
     
-    # Try load existing model
-    existing_model, existing_scaler = load_model_and_scaler()
+    # STEP 3: Generate predictions for trained symbols
+    if trained_symbols:
+        print("\n🔮 STEP 3: GENERATING PREDICTIONS")
+        print("="*60)
+        
+        for symbol in trained_symbols:
+            try:
+                pipeline.run_prediction(symbol)
+            except Exception as e:
+                print(f"❌ Error predicting {symbol}: {e}")
     
-    # Collect data
-    print("\n📥 Fetching market data...")
-    all_data = []
-    
-    for symbol in SYMBOLS:
-        df = fetch_ohlc_data(symbol, periods=500)
-        if df is not None:
-            df = calculate_features(df)
-            df = create_labels(df, threshold=0.001)
-            df = df.dropna()
-            
-            if len(df) > 0:
-                all_data.append(df)
-                print(f"   ✅ {symbol}: {len(df)} samples")
-    
-    if not all_data:
-        print("❌ No data!")
-        mt5.shutdown()
-        return
-    
-    # Combine
-    combined_df = pd.concat(all_data, ignore_index=True)
-    print(f"\n📊 Total: {len(combined_df)} samples")
-    
-    # Prepare features
-    feature_cols = [col for col in combined_df.columns if col not in 
-                    ['time', 'label', 'future_price', 'price_change',
-                     'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume',
-                     'tr1', 'tr2', 'tr3', 'tr']]
-    
-    X = combined_df[feature_cols].values
-    y = combined_df['label'].values
-    
-    # Scale
-    if existing_scaler is not None:
-        scaler = existing_scaler
-        X_scaled = scaler.transform(X)
-        print("📐 Using existing scaler")
-    else:
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        print("📐 Created new scaler")
-    
-    # Train or fine-tune
-    model = train_or_finetune(X_scaled, y, existing_model)
-    
-    # Save model & scaler
-    save_model_and_scaler(model, scaler)
-    
-    # Make predictions
-    print(f"\n🔮 Making predictions (threshold: {PREDICTION_THRESHOLD*100}%)...")
-    saved_count = 0
-    
-    for symbol in SYMBOLS:
-        df = fetch_ohlc_data(symbol, periods=100)
-        if df is not None:
-            df = calculate_features(df)
-            df = df.dropna()
-            
-            if len(df) > 0:
-                if make_predictions(model, scaler, symbol, df):
-                    saved_count += 1
-    
-    print(f"\n✅ Saved {saved_count} predictions")
-    
-    mt5.shutdown()
-    print("\n🏁 Complete!")
-    print(f"💾 Model will be reused in next run for faster training")
+    print("\n" + "="*60)
+    print("✅ PIPELINE COMPLETED!")
+    print("="*60)
+    print(f"\n📌 Summary:")
+    print(f"   • Checked: {len(config.SYMBOLS)} symbols")
+    print(f"   • Found new data: {len(symbols_to_process)} symbols")
+    print(f"   • Trained models: {len(trained_symbols)} symbols")
+    print(f"   • Generated predictions: {len(trained_symbols)} symbols")
+    print("\n   Next steps:")
+    print("   1. Check 'predictions' table in Supabase")
+    print("   2. EA will read predictions and execute trades")
+    print("   3. Next automatic check in 1 hour")
+    print("\n   ℹ️  Version 1.2 - Unix timestamp for timezone sync")
+    print("\n")
 
 if __name__ == "__main__":
     main()
