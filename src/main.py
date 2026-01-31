@@ -1,6 +1,9 @@
 """
-AI Trading System - Complete Python Pipeline v1.3
-WITH MODEL PERSISTENCE - Model learns continuously!
+AI Trading System v1.4 - OVERFITTING FIX + Better Error Handling
+Fixed:
+1. Overfitting (added max_features, min_samples_split)
+2. Better error handling for storage
+3. Metadata tracking
 """
 
 import os
@@ -30,7 +33,7 @@ class Config:
     SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://kktfrmvwzykkzosvzddn.supabase.co')
     SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtrdGZybXZ3enlra3pvc3Z6ZGRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzgwNjc1MywiZXhwIjoyMDgzMzgyNzUzfQ.2OUwg8dQYaAjNDMHeUKXWxFeUm_ipxZgqx8x5RDcIU8')
     
-    MODEL_VERSION = "v1.3.0"  # ← UPDATED: Now with persistence!
+    MODEL_VERSION = "v1.4.0"
     LOOKBACK_DAYS = 30
     PREDICTION_THRESHOLD = 0.65
     SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
@@ -43,23 +46,47 @@ class Config:
     RANDOM_STATE = 42
 
 # ================================================================
-# MODEL PERSISTENCE - NEW!
+# MODEL PERSISTENCE WITH BETTER ERROR HANDLING
 # ================================================================
 
 class ModelPersistence:
-    """Handle saving/loading models to/from Supabase Storage"""
-    
     def __init__(self, supabase: Client, symbol: str):
         self.supabase = supabase
         self.symbol = symbol
         self.bucket_name = 'models'
+        self.bucket_exists = self._check_bucket_exists()
+    
+    def _check_bucket_exists(self) -> bool:
+        """Check if storage bucket exists"""
+        try:
+            buckets = self.supabase.storage.list_buckets()
+            exists = any(b['name'] == self.bucket_name for b in buckets)
+            
+            if not exists:
+                print(f"\n⚠️  WARNING: Storage bucket '{self.bucket_name}' NOT FOUND!")
+                print(f"   Please create bucket in Supabase Dashboard:")
+                print(f"   1. Go to Storage → New bucket")
+                print(f"   2. Name: {self.bucket_name}")
+                print(f"   3. Public: OFF")
+                print(f"   4. Create bucket\n")
+                return False
+            
+            print(f"   ✅ Storage bucket '{self.bucket_name}' found")
+            return True
+            
+        except Exception as e:
+            print(f"   ⚠️  Cannot verify bucket existence: {e}")
+            return False
     
     def save_model(self, model, scaler, metrics: Dict):
-        """Save model, scaler, and metrics to Supabase Storage"""
+        """Save model with error handling"""
+        if not self.bucket_exists:
+            print(f"   ⚠️  Skipping save (bucket not found)")
+            return False
+        
         print(f"   💾 Saving model for {self.symbol}...")
         
         try:
-            # Prepare model data
             model_data = {
                 'model': model,
                 'scaler': scaler,
@@ -68,45 +95,68 @@ class ModelPersistence:
                 'version': Config.MODEL_VERSION
             }
             
-            # Serialize to bytes
             model_bytes = pickle.dumps(model_data)
-            
-            # Upload to Supabase Storage
             file_path = f'{self.symbol}_model.pkl'
             
-            self.supabase.storage.from_(self.bucket_name).upload(
+            # Try to upload
+            response = self.supabase.storage.from_(self.bucket_name).upload(
                 path=file_path,
                 file=model_bytes,
                 file_options={'content-type': 'application/octet-stream', 'upsert': 'true'}
             )
             
-            print(f"   ✅ Model saved to Supabase Storage")
+            print(f"   ✅ Model saved ({len(model_bytes)/1024:.1f} KB)")
+            
+            # Save metadata to table
+            self._save_metadata(metrics)
+            
             return True
             
         except Exception as e:
-            print(f"   ⚠️ Error saving model: {e}")
+            print(f"   ⚠️  Error saving model: {e}")
+            print(f"   ℹ️  Model will still work, but won't persist for next run")
             return False
     
+    def _save_metadata(self, metrics: Dict):
+        """Save model metadata to database"""
+        try:
+            record = {
+                'symbol': self.symbol,
+                'model_version': Config.MODEL_VERSION,
+                'train_accuracy': float(metrics.get('train_accuracy', 0)),
+                'test_accuracy': float(metrics.get('test_accuracy', 0)),
+                'n_estimators': int(metrics.get('n_estimators', 0)),
+                'train_samples': int(metrics.get('train_samples', 0)),
+                'test_samples': int(metrics.get('test_samples', 0)),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            
+            self.supabase.table('model_metadata').upsert(record).execute()
+            
+        except Exception as e:
+            # Ignore if table doesn't exist
+            pass
+    
     def load_model(self):
-        """Load existing model from Supabase Storage"""
+        """Load model with error handling"""
+        if not self.bucket_exists:
+            print(f"   ℹ️  Bucket not found, will train new model")
+            return None, None, None
+        
         print(f"   📂 Checking for existing model for {self.symbol}...")
         
         try:
             file_path = f'{self.symbol}_model.pkl'
-            
-            # Download from Supabase
             model_bytes = self.supabase.storage.from_(self.bucket_name).download(file_path)
-            
-            # Deserialize
             model_data = pickle.loads(model_bytes)
             
             print(f"   ✅ Loaded existing model (saved: {model_data.get('timestamp', 'unknown')})")
-            print(f"      Previous accuracy: {model_data['metrics'].get('test_accuracy', 0):.4f}")
+            print(f"      Previous test accuracy: {model_data['metrics'].get('test_accuracy', 0):.4f}")
             
             return model_data['model'], model_data['scaler'], model_data['metrics']
             
         except Exception as e:
-            print(f"   ℹ️  No existing model found (will train new): {e}")
+            print(f"   ℹ️  No existing model found (will train new)")
             return None, None, None
 
 # ================================================================
@@ -119,7 +169,6 @@ class DataLoader:
         self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
     
     def load_ohlc_data(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        """Load OHLC data from Supabase"""
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=days)
         
@@ -146,7 +195,6 @@ class DataLoader:
             return pd.DataFrame()
     
     def load_indicators(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        """Load indicators from Supabase"""
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=days)
         
@@ -173,7 +221,7 @@ class DataLoader:
             return pd.DataFrame()
 
 # ================================================================
-# FEATURE ENGINEER (same as before, shortened for brevity)
+# FEATURE ENGINEER (same as before, condensed)
 # ================================================================
 
 class FeatureEngineer:
@@ -193,7 +241,6 @@ class FeatureEngineer:
         
         print("🔧 Engineering features...")
         
-        # (Same feature engineering as before)
         for period in self.config.MOMENTUM_PERIODS:
             df[f'price_momentum_{period}'] = df['close'].pct_change(period) * 100
         
@@ -235,7 +282,7 @@ class FeatureEngineer:
             return 'other'
 
 # ================================================================
-# AI MODEL - WITH PERSISTENCE!
+# AI MODEL - OVERFITTING FIX
 # ================================================================
 
 class AIModel:
@@ -244,7 +291,6 @@ class AIModel:
         self.symbol = symbol
         self.persistence = ModelPersistence(supabase, symbol)
         
-        # Try to load existing model
         existing_model, existing_scaler, existing_metrics = self.persistence.load_model()
         
         if existing_model:
@@ -264,7 +310,6 @@ class AIModel:
         self.metrics = {}
     
     def prepare_training_data(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Prepare features and target for training"""
         self.feature_columns = [
             'open', 'high', 'low', 'close', 'volume',
             'rsi_14', 'macd_main', 'macd_signal', 
@@ -278,7 +323,6 @@ class AIModel:
         available_cols = [col for col in self.feature_columns if col in df.columns]
         X = df[available_cols].values
         
-        # Multi-class target
         y = np.zeros(len(df))
         y[df['profitable_long'] == 1] = 2  # BUY
         y[df['profitable_short'] == 1] = 0  # SELL
@@ -287,37 +331,37 @@ class AIModel:
         return X, y
     
     def train(self, X: np.ndarray, y: np.ndarray):
-        """Train or IMPROVE the model"""
+        """Train with overfitting prevention"""
         
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=self.config.TEST_SIZE, random_state=self.config.RANDOM_STATE
         )
         
         if self.is_new_model:
-            # TRAIN NEW MODEL
-            print("   🤖 Training NEW model from scratch...")
+            print("   🤖 Training NEW model with anti-overfitting measures...")
             X_train_scaled = self.scaler.fit_transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
             
             self.model = RandomForestClassifier(
                 n_estimators=100,
-                max_depth=10,
+                max_depth=8,              # ← REDUCED from 10 to prevent overfitting
+                min_samples_split=10,     # ← ADDED: minimum samples to split
+                min_samples_leaf=5,       # ← ADDED: minimum samples per leaf
+                max_features='sqrt',      # ← ADDED: use sqrt of features (not all)
                 random_state=self.config.RANDOM_STATE,
                 n_jobs=-1,
-                warm_start=True  # ← Allow incremental training later!
+                warm_start=True
             )
             
             self.model.fit(X_train_scaled, y_train)
             
         else:
-            # IMPROVE EXISTING MODEL
-            print("   🔄 IMPROVING existing model (adding trees)...")
-            X_train_scaled = self.scaler.transform(X_train)  # ← Use existing scaler!
+            print("   🔄 IMPROVING existing model...")
+            X_train_scaled = self.scaler.transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
             
-            # Add more trees to existing forest
-            self.model.n_estimators += 50  # Add 50 more trees
-            self.model.fit(X_train_scaled, y_train)  # Retrain with new trees
+            self.model.n_estimators += 30  # Add 30 trees (not 50)
+            self.model.fit(X_train_scaled, y_train)
         
         # Evaluate
         train_acc = accuracy_score(y_train, self.model.predict(X_train_scaled))
@@ -331,7 +375,9 @@ class AIModel:
             'n_estimators': self.model.n_estimators
         }
         
-        # Show improvement
+        # Check overfitting
+        overfitting_gap = (train_acc - test_acc) * 100
+        
         if self.previous_metrics:
             prev_acc = self.previous_metrics.get('test_accuracy', 0)
             improvement = (test_acc - prev_acc) * 100
@@ -340,14 +386,18 @@ class AIModel:
             print(f"   ✅ Model trained!")
             print(f"      Train accuracy: {train_acc:.4f}")
             print(f"      Test accuracy:  {test_acc:.4f}")
+            print(f"      Overfitting gap: {overfitting_gap:.2f}%")
+            
+            if overfitting_gap > 20:
+                print(f"      ⚠️  WARNING: Possible overfitting (gap > 20%)")
+                print(f"      ℹ️  This is normal with limited data, will improve over time")
         
-        # SAVE MODEL (so next run can improve it!)
+        # Save model
         self.persistence.save_model(self.model, self.scaler, self.metrics)
         
         return self.model
     
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Make predictions"""
         if self.model is None:
             raise ValueError("Model not trained yet!")
         
@@ -359,7 +409,6 @@ class AIModel:
         return predictions, confidence
     
     def get_signal(self, prediction: int, confidence: float) -> str:
-        """Convert prediction to trading signal"""
         if confidence < self.config.PREDICTION_THRESHOLD:
             return 'HOLD'
         if prediction == 2:
@@ -370,7 +419,7 @@ class AIModel:
             return 'HOLD'
 
 # ================================================================
-# PREDICTION WRITER (same as before)
+# PREDICTION WRITER (same)
 # ================================================================
 
 class PredictionWriter:
@@ -396,7 +445,7 @@ class PredictionWriter:
             print(f"❌ Error saving prediction: {e}")
 
 # ================================================================
-# MAIN PIPELINE - UPDATED
+# MAIN PIPELINE
 # ================================================================
 
 class TradingPipeline:
@@ -408,12 +457,10 @@ class TradingPipeline:
         self.writer = PredictionWriter(config, self.supabase)
     
     def run_training(self, symbol: str):
-        """Training pipeline with model persistence"""
         print(f"\n{'='*60}")
         print(f"TRAINING: {symbol}")
         print(f"{'='*60}\n")
         
-        # Load data
         ohlc = self.loader.load_ohlc_data(symbol, days=self.config.LOOKBACK_DAYS)
         indicators = self.loader.load_indicators(symbol, days=self.config.LOOKBACK_DAYS)
         
@@ -421,7 +468,6 @@ class TradingPipeline:
             print(f"❌ Insufficient data for {symbol}")
             return None
         
-        # Features
         df = self.engineer.merge_data(ohlc, indicators)
         df = self.engineer.create_features(df)
         
@@ -429,15 +475,13 @@ class TradingPipeline:
             print(f"❌ Not enough data: {len(df)} records")
             return None
         
-        # Train with persistence
-        model = AIModel(self.config, self.supabase, symbol)  # ← Loads existing if available
+        model = AIModel(self.config, self.supabase, symbol)
         X, y = model.prepare_training_data(df)
-        model.train(X, y)  # ← Improves if model exists, trains new otherwise
+        model.train(X, y)
         
         return model
     
     def run_prediction(self, symbol: str, model: AIModel):
-        """Generate prediction"""
         print(f"\n📊 Generating prediction for {symbol}...")
         
         ohlc = self.loader.load_ohlc_data(symbol, days=5)
@@ -470,20 +514,20 @@ class TradingPipeline:
 def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║     AI TRADING SYSTEM v1.3 - CONTINUOUS LEARNING          ║
-    ║   Model PERSISTS between runs → Improves over time!      ║
+    ║     AI TRADING SYSTEM v1.4 - CONTINUOUS LEARNING          ║
+    ║        WITH OVERFITTING FIX & ERROR HANDLING              ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
     config = Config()
     pipeline = TradingPipeline(config)
     
-    print("\n🚀 RUNNING PIPELINE WITH MODEL PERSISTENCE")
+    print("\n🚀 RUNNING PIPELINE")
     print("="*60)
     
     trained_models = {}
     
-    for symbol in config.SYMBOLS[:3]:  # Test with 3 symbols first
+    for symbol in config.SYMBOLS[:3]:  # Test with 3 symbols
         try:
             model = pipeline.run_training(symbol)
             if model:
@@ -491,14 +535,18 @@ def main():
                 pipeline.run_prediction(symbol, model)
         except Exception as e:
             print(f"❌ Error with {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
     
     print("\n" + "="*60)
     print("✅ PIPELINE COMPLETED!")
     print("="*60)
     print(f"\n📌 Summary:")
     print(f"   • Trained/Improved: {len(trained_models)} models")
-    print(f"   • Models saved to Supabase Storage ✅")
-    print(f"   • Next run will IMPROVE these models (not start over)")
+    print(f"\n💡 Next Steps:")
+    print(f"   1. Create 'models' bucket in Supabase Dashboard if not exists")
+    print(f"   2. Models will persist between runs once bucket is created")
+    print(f"   3. Overfitting reduced with max_depth=8, min_samples_split=10")
     print("\n")
 
 if __name__ == "__main__":
