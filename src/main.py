@@ -30,7 +30,7 @@ class Config:
     SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://kktfrmvwzykkzosvzddn.supabase.co')
     SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtrdGZybXZ3enlra3pvc3Z6ZGRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzgwNjc1MywiZXhwIjoyMDgzMzgyNzUzfQ.2OUwg8dQYaAjNDMHeUKXWxFeUm_ipxZgqx8x5RDcIU8')
     
-    MODEL_VERSION = "v1.5.0"
+    MODEL_VERSION = "v1.6.0"
     LOOKBACK_DAYS = 30
     PREDICTION_THRESHOLD = 0.65
     SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
@@ -94,11 +94,18 @@ class ModelPersistence:
             model_bytes = pickle.dumps(model_data)
             file_path = f'{self.symbol}_model.pkl'
             
-            # Upload
+            # Delete old file first (if exists)
+            try:
+                self.supabase.storage.from_(self.bucket_name).remove([file_path])
+                print(f"   🗑️  Deleted old model")
+            except:
+                pass  # No old file, that's OK
+            
+            # Upload new file
             self.supabase.storage.from_(self.bucket_name).upload(
                 path=file_path,
                 file=model_bytes,
-                file_options={'content-type': 'application/octet-stream', 'upsert': 'true'}
+                file_options={'content-type': 'application/octet-stream'}
             )
             
             print(f"   ✅ Model saved ({len(model_bytes)/1024:.1f} KB)")
@@ -508,8 +515,8 @@ class TradingPipeline:
 def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║     AI TRADING SYSTEM v1.5 - CONTINUOUS LEARNING          ║
-    ║           WITH BUCKET CHECK FIX                           ║
+    ║     AI TRADING SYSTEM v1.6 - CONTINUOUS LEARNING          ║
+    ║        DUPLICATE UPLOAD FIX + ALL 10 SYMBOLS              ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
