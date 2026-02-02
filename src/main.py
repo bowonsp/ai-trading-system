@@ -1,13 +1,13 @@
 """
-AI Trading System v1.5 - BUCKET CHECK FIX
-Fixed: SyncBucket error + improved storage handling
+AI Trading System v1.7 - TIMEZONE FIX + BUCKET CHECK
+Fixed: Timezone issues + SyncBucket error + improved storage handling
 """
 
 import os
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta  # ← ADDED timezone
 from typing import Dict, List, Tuple
 import pickle
 import warnings
@@ -30,7 +30,7 @@ class Config:
     SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://kktfrmvwzykkzosvzddn.supabase.co')
     SUPABASE_KEY = os.getenv('SUPABASE_KEY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtrdGZybXZ3enlra3pvc3Z6ZGRuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzgwNjc1MywiZXhwIjoyMDgzMzgyNzUzfQ.2OUwg8dQYaAjNDMHeUKXWxFeUm_ipxZgqx8x5RDcIU8')
     
-    MODEL_VERSION = "v1.6.0"
+    MODEL_VERSION = "v1.7.0"  # ← UPDATED from v1.6.0
     LOOKBACK_DAYS = 30
     PREDICTION_THRESHOLD = 0.65
     SYMBOLS = ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 
@@ -75,7 +75,7 @@ class ModelPersistence:
                 return True  # Assume exists, let upload/download fail if not
     
     def save_model(self, model, scaler, metrics: Dict):
-        """Save model with better error handling"""
+        """Save model with better error handling + TIMEZONE FIX"""
         if not self.bucket_exists:
             print(f"   ⏭️  Skipping save (bucket not found)")
             return False
@@ -83,11 +83,14 @@ class ModelPersistence:
         print(f"   💾 Saving model for {self.symbol}...")
         
         try:
+            # ===== TIMEZONE FIX: Use UTC timezone-aware datetime =====
+            now_utc = datetime.now(timezone.utc)
+            
             model_data = {
                 'model': model,
                 'scaler': scaler,
                 'metrics': metrics,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': now_utc.isoformat(),  # ← UTC aware
                 'version': Config.MODEL_VERSION
             }
             
@@ -121,8 +124,11 @@ class ModelPersistence:
             return False
     
     def _save_metadata(self, metrics: Dict):
-        """Save model metadata to database"""
+        """Save model metadata to database with TIMEZONE FIX"""
         try:
+            # ===== TIMEZONE FIX =====
+            now_utc = datetime.now(timezone.utc)
+            
             record = {
                 'symbol': self.symbol,
                 'model_version': Config.MODEL_VERSION,
@@ -131,7 +137,7 @@ class ModelPersistence:
                 'n_estimators': int(metrics.get('n_estimators', 0)),
                 'train_samples': int(metrics.get('train_samples', 0)),
                 'test_samples': int(metrics.get('test_samples', 0)),
-                'updated_at': datetime.utcnow().isoformat()
+                'updated_at': now_utc.isoformat()  # ← UTC aware
             }
             
             self.supabase.table('model_metadata').upsert(record).execute()
@@ -171,7 +177,8 @@ class DataLoader:
         self.supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
     
     def load_ohlc_data(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        end_date = datetime.utcnow()
+        # ===== TIMEZONE FIX =====
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         try:
@@ -197,7 +204,8 @@ class DataLoader:
             return pd.DataFrame()
     
     def load_indicators(self, symbol: str, days: int = 30) -> pd.DataFrame:
-        end_date = datetime.utcnow()
+        # ===== TIMEZONE FIX =====
+        end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days)
         
         try:
@@ -420,7 +428,7 @@ class AIModel:
             return 'HOLD'
 
 # ================================================================
-# PREDICTION WRITER
+# PREDICTION WRITER - WITH TIMEZONE FIX
 # ================================================================
 
 class PredictionWriter:
@@ -430,9 +438,12 @@ class PredictionWriter:
     
     def save_prediction(self, symbol: str, signal: str, confidence: float):
         try:
+            # ===== TIMEZONE FIX: Use UTC timezone-aware datetime =====
+            now_utc = datetime.now(timezone.utc)
+            
             record = {
-                'timestamp': datetime.utcnow().isoformat(),
-                'timestamp_unix': int(time.time()),
+                'timestamp': now_utc.isoformat(),                  # ← UTC aware
+                'timestamp_unix': int(now_utc.timestamp()),        # ← UNIX TIMESTAMP (KEY FIX!)
                 'symbol': symbol,
                 'model_version': self.config.MODEL_VERSION,
                 'prediction': signal,
@@ -515,8 +526,8 @@ class TradingPipeline:
 def main():
     print("""
     ╔═══════════════════════════════════════════════════════════╗
-    ║     AI TRADING SYSTEM v1.6 - CONTINUOUS LEARNING          ║
-    ║        DUPLICATE UPLOAD FIX + ALL 10 SYMBOLS              ║
+    ║     AI TRADING SYSTEM v1.7 - TIMEZONE FIX                 ║
+    ║        CONTINUOUS LEARNING + UNIX TIMESTAMP               ║
     ╚═══════════════════════════════════════════════════════════╝
     """)
     
@@ -528,7 +539,7 @@ def main():
     
     trained_models = {}
     
-    # Process ALL 10 symbols (change to [:3] for testing)
+    # Process ALL 10 symbols
     for symbol in config.SYMBOLS:
         try:
             model = pipeline.run_training(symbol)
@@ -541,12 +552,13 @@ def main():
             traceback.print_exc()
     
     print("\n" + "="*60)
-    print("✅ PIPELINE COMPLETED!")
+    print("✅ PIPELINE COMPLETED WITH TIMEZONE FIX!")
     print("="*60)
     print(f"\n📌 Summary:")
     print(f"   • Trained/Improved: {len(trained_models)} models")
     if trained_models:
         print(f"   • Models saved to Supabase Storage")
+        print(f"   • Predictions include timestamp_unix (timezone-safe)")
         print(f"   • Next run will improve existing models")
     else:
         print(f"   • No models saved (check bucket setup)")
